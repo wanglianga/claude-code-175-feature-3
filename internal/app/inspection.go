@@ -237,8 +237,21 @@ func (s *Service) SubmitInspection(ctx context.Context, contractID string, in Su
 				return err
 			}
 		}
+		// 若此前已有未闭合争议(如退租后、验房前租客提前打开的水电尾款分摊争议),
+		// 合同保持 DISPUTING; 争议全部闭合后 afterDisputeResolved 会回到 DEDUCTION_PROPOSED。
+		var openDisp int
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*) FROM disputes WHERE contract_id=$1
+			  AND status IN ('OPEN','EVIDENCE_PENDING','UNDER_REVIEW')`, contractID).
+			Scan(&openDisp); err != nil {
+			return err
+		}
+		nextContractStatus := domain.StatusDeductionProposed
+		if openDisp > 0 {
+			nextContractStatus = domain.StatusDisputing
+		}
 		if _, err := tx.Exec(ctx,
-			`UPDATE contracts SET status='DEDUCTION_PROPOSED' WHERE id=$1`, contractID); err != nil {
+			`UPDATE contracts SET status=$2 WHERE id=$1`, contractID, nextContractStatus); err != nil {
 			return err
 		}
 		c, _ := s.getContract(tx, ctx, contractID)
@@ -313,6 +326,13 @@ func (s *Service) buildSnapshot(tx pgx.Tx, ctx context.Context, contractID strin
 	if err := tx.QueryRow(ctx, `
 		SELECT COALESCE(sum(billed_amount),0) FROM utility_readings
 		WHERE contract_id=$1 AND phase='CHECKOUT'`, contractID).Scan(&snap.UtilityBilledTotal); err != nil {
+		return snap, err
+	}
+	// 退租时已就"最后一期未出账水电账单"预留押金的, 规则引擎不再产出水电欠费扣款建议,
+	// 避免与预留/最终结算双重扣款。
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM utility_reservations WHERE contract_id=$1)`,
+		contractID).Scan(&snap.UtilityReserved); err != nil {
 		return snap, err
 	}
 	return snap, nil
@@ -715,6 +735,18 @@ func (s *Service) ProposeSettlement(ctx context.Context, contractID, note string
 			return fmt.Errorf("%w: 仍有 %.2f 元扣款项处于待确认/争议中, 不能生成结算",
 				ErrUnresolved, disputed)
 		}
+		// 水电尾款预留尚未最终结算时, 不生成主押金结算(预留也是 hard_hold 的一部分,
+		// 必须先多退少补完成唯一一笔水电最终流水; DB 触发器在 CONFIRMED 时再次兜底)。
+		var pendN int
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*) FROM utility_reservations
+			WHERE contract_id=$1 AND status <> 'SETTLED'`, contractID).Scan(&pendN); err != nil {
+			return err
+		}
+		if pendN > 0 {
+			return fmt.Errorf("%w: 水电尾款预留尚未最终结算(多退少补), 主押金结算暂缓",
+				ErrUnresolved)
+		}
 		// 汇总定论项
 		var fids, cids []string
 		fr, err := tx.Query(ctx, `
@@ -744,7 +776,18 @@ func (s *Service) ProposeSettlement(ctx context.Context, contractID, note string
 		}
 		cr.Close()
 
-		return2tenant := round2(balance - hard)
+		// 水电尾款已通过"唯一一笔最终流水"出托管的部分:
+		// utilPaid 已付给供应商/房东, utilRefunded 已退还租客, 二者都不再在 escrow.balance 里,
+		// 但主结算单必须体现完整押金去向(CHECK: deducted + returned = deposit)。
+		var utilPaid, utilRefunded float64
+		if err := tx.QueryRow(ctx, `
+			SELECT COALESCE(sum(from_deposit),0), COALESCE(sum(refund_to_tenant),0)
+			FROM final_utility_settlements WHERE contract_id=$1`,
+			contractID).Scan(&utilPaid, &utilRefunded); err != nil {
+			return err
+		}
+		deductedTotal := round2(hard + utilPaid)
+		return2tenant := round2(balance - hard + utilRefunded)
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO deductions(contract_id,total_amount,status,finding_ids,charge_ids,created_by)
 			VALUES($1,$2,'PROPOSED',$3::uuid[],$4::uuid[],$5)
@@ -752,7 +795,7 @@ func (s *Service) ProposeSettlement(ctx context.Context, contractID, note string
 			  SET total_amount=EXCLUDED.total_amount, status='PROPOSED',
 			      finding_ids=EXCLUDED.finding_ids, charge_ids=EXCLUDED.charge_ids,
 			      approved_at=NULL`,
-			contractID, hard, pgUUIDArrayLiteral(fids), pgUUIDArrayLiteral(cids),
+			contractID, deductedTotal, pgUUIDArrayLiteral(fids), pgUUIDArrayLiteral(cids),
 			actor(ctx).ID); err != nil {
 			return fmt.Errorf("upsert deduction: %w", err)
 		}
@@ -768,13 +811,15 @@ func (s *Service) ProposeSettlement(ctx context.Context, contractID, note string
 			      tenant_confirmed_at=NULL, landlord_confirmed_at=NULL,
 			      finding_ids=EXCLUDED.finding_ids, charge_ids=EXCLUDED.charge_ids
 			RETURNING id::text`,
-			contractID, deposit, hard, return2tenant, hard, note,
+			contractID, deposit, deductedTotal, return2tenant, deductedTotal, note,
 			pgUUIDArrayLiteral(fids), pgUUIDArrayLiteral(cids)).Scan(&id)
 		if err != nil {
 			return fmt.Errorf("upsert settlement: %w", err)
 		}
 		return s.emit(tx, ctx, contractID, "SettlementProposed", map[string]any{
-			"settlement_id": id, "deducted_total": hard, "returned_to_tenant": return2tenant,
+			"settlement_id": id, "deducted_total": deductedTotal,
+			"returned_to_tenant": return2tenant,
+			"utility_paid":       utilPaid, "utility_refunded": utilRefunded,
 		}, actor(ctx).ID)
 	})
 	return id, err
@@ -1003,8 +1048,18 @@ func mapPgGuardError(err error) error {
 	if strings.Contains(msg, "CONFLICT_OPEN_DISPUTE") {
 		return fmt.Errorf("%w: 存在未闭合争议, 结算/释放被阻止", ErrUnresolved)
 	}
+	if strings.Contains(msg, "CONFLICT_UTILITY_PENDING") {
+		return fmt.Errorf("%w: 水电尾款预留尚未最终结算, 主押金结算被阻止", ErrUnresolved)
+	}
 	if strings.Contains(msg, "CONFLICT_HOLD_MISMATCH") {
 		return fmt.Errorf("%w: 结算金额与定论预留不一致", ErrConflict)
+	}
+	if strings.Contains(msg, "CONFLICT_UTILITY_RESERVE_MISMATCH") ||
+		strings.Contains(msg, "CONFLICT_UTILITY_LEDGER_MISMATCH") {
+		return fmt.Errorf("%w: 水电最终结算金额勾稽不一致", ErrConflict)
+	}
+	if strings.Contains(msg, "CONFLICT_UTILITY_BAD_STATE") {
+		return fmt.Errorf("%w: 水电预留状态不允许最终结算", ErrBadState)
 	}
 	return err
 }

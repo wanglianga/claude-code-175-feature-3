@@ -188,3 +188,27 @@ func TestApplianceMissingAtCheckinExempt(t *testing.T) {
 		t.Fatalf("入住时即缺失的家电应免责, got %+v", f)
 	}
 }
+
+// TestUtilityReservedSkipsArrears 退租时已为最后一期未出账账单预留押金的,
+// 验房引擎不得再生成水电欠费建议, 避免与预留/最终结算双重扣款。
+func TestUtilityReservedSkipsArrears(t *testing.T) {
+	base := Snapshot{
+		UtilityStatus: "UNPAID", UtilityBilledTotal: 265,
+		CleaningStatus: "CLEAN", KeysStatus: "RETURNED",
+		WallStatus: "GOOD", FloorStatus: "GOOD", ApplianceStatus: "GOOD",
+		DepositAmount: 10000,
+	}
+	without := Generate(base)
+	if findCharge(without, ChargeUtilityArrears) == nil {
+		t.Fatal("未预留时应生成水电欠费建议")
+	}
+	with := base
+	with.UtilityReserved = true
+	r := Generate(with)
+	if findCharge(r, ChargeUtilityArrears) != nil {
+		t.Fatalf("已预留后不应再生成水电欠费建议, got %+v", r.Charges)
+	}
+	if r.DeductibleTotal() != 0 {
+		t.Fatalf("已预留且无其他损坏时建议合计应为 0, got %.2f", r.DeductibleTotal())
+	}
+}

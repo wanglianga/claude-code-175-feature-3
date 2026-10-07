@@ -66,6 +66,9 @@ type Snapshot struct {
 	CleaningFee       float64
 	// 水电煤区间应结金额(按入住/退租读数与单价算出)
 	UtilityBilledTotal float64
+	// 退租时最后一期水电账单尚未出, 平台已就水电尾款做押金预留:
+	// 引擎不再生成 UTILITY_ARREARS 扣款建议(避免与预留/最终结算双重扣款)。
+	UtilityReserved bool
 }
 
 // Suggestion 是一条可扣款项建议(findings 表)。
@@ -132,7 +135,7 @@ func Generate(s Snapshot) Report {
 			Amount: cap0(s.KeyReplacementFee),
 		})
 	}
-	if s.UtilityStatus == "UNPAID" && s.UtilityBilledTotal > 0 {
+	if s.UtilityStatus == "UNPAID" && s.UtilityBilledTotal > 0 && !s.UtilityReserved {
 		r.Charges = append(r.Charges, ChargeSuggestion{
 			Code:   ChargeUtilityArrears,
 			Title:  "水电煤欠费代缴",

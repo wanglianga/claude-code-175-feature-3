@@ -53,8 +53,19 @@ func (s *Server) Routes() *Router {
 	r.Handle("POST", "api/v1/contracts/{id}/settlement/propose", s.withAuth(s.proposeSettlement))
 	r.Handle("POST", "api/v1/contracts/{id}/settlement/confirm", s.withAuth(s.confirmSettlement))
 
-	// 平台: 逾期未验房巡检
+	// 退租水电尾款结算: 预留 -> 供应商账单 -> 照片复核 -> 人工复核 -> 唯一一笔最终押金流水
+	r.Handle("POST", "api/v1/contracts/{id}/utility-reservation", s.withAuth(s.createUtilityReservation))
+	r.Handle("POST", "api/v1/contracts/{id}/utility-reservation/{rid}/bills", s.withAuth(s.submitSupplierBill))
+	r.Handle("POST", "api/v1/contracts/{id}/utility-reservation/{rid}/meter-photos", s.withAuth(s.submitMeterPhotos))
+	r.Handle("POST", "api/v1/contracts/{id}/utility-reservation/{rid}/review", s.withAuth(s.reviewMeter))
+	r.Handle("POST", "api/v1/contracts/{id}/utility-reservation/{rid}/dispute", s.withAuth(s.openUtilityDispute))
+	r.Handle("POST", "api/v1/contracts/{id}/utility-reservation/{rid}/manual-resolve", s.withAuth(s.resolveUtilityManual))
+	r.Handle("POST", "api/v1/contracts/{id}/utility-reservation/{rid}/finalize", s.withAuth(s.finalizeUtility))
+	r.Handle("POST", "api/v1/contracts/{id}/utility-supplements/{sid}/pay", s.withAuth(s.paySupplement))
+
+	// 平台: 逾期未验房巡检 / 水电账单延迟巡检
 	r.Handle("POST", "api/v1/admin/overdue-inspections", s.withAuth(s.autoOverdue))
+	r.Handle("POST", "api/v1/admin/utility-bill-delay", s.withAuth(s.autoUtilityBillDelay))
 
 	return r
 }
@@ -361,4 +372,138 @@ func (s *Server) autoOverdue(w http.ResponseWriter, r *http.Request, a app.Actor
 		return
 	}
 	writeJSON(w, 200, map[string]any{"opened": ids})
+}
+
+// ---------- 退租水电尾款结算 ----------
+
+func (s *Server) createUtilityReservation(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	var in app.CreateUtilityReservationInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	rid, err := s.svc.CreateUtilityReservation(app.WithActor(r.Context(), a), Param(r, "id"), in)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 201, map[string]string{"reservation_id": rid, "status": "RESERVED"})
+}
+
+func (s *Server) submitSupplierBill(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	var in app.SubmitSupplierBillInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	rid, dup, err := s.svc.SubmitSupplierBill(app.WithActor(r.Context(), a),
+		Param(r, "id"), Param(r, "rid"), in)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	status := 201
+	if dup {
+		status = 200
+	}
+	writeJSON(w, status, map[string]any{
+		"bill_id": rid, "duplicated": dup,
+		"message": map[bool]string{true: "同一账单号已登记, 幂等返回, 未重复扣款"}[dup],
+	})
+}
+
+func (s *Server) submitMeterPhotos(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	var in app.SubmitMeterPhotosInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if err := s.svc.SubmitMeterPhotos(app.WithActor(r.Context(), a),
+		Param(r, "id"), Param(r, "rid"), in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "message": "照片读数已登记, 将与供应商账单交叉复核, 不会只按账单扣款"})
+}
+
+func (s *Server) reviewMeter(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	var in app.ReviewMeterInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	id, err := s.svc.ReviewMeterEvidence(app.WithActor(r.Context(), a),
+		Param(r, "id"), Param(r, "rid"), in)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"meter_review_id": id, "decision": in.Decision})
+}
+
+func (s *Server) openUtilityDispute(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	var in struct {
+		Comment string `json:"comment"`
+	}
+	_ = decode(r, &in)
+	id, err := s.svc.OpenUtilityAllocationDispute(app.WithActor(r.Context(), a),
+		Param(r, "id"), in.Comment)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 201, map[string]string{
+		"dispute_id": id, "reason": "UTILITY_FINAL_SETTLEMENT",
+		"status": "MANUAL_REVIEW",
+	})
+}
+
+func (s *Server) resolveUtilityManual(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	var in app.ResolveUtilityManualInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if err := s.svc.ResolveUtilityManual(app.WithActor(r.Context(), a),
+		Param(r, "id"), Param(r, "rid"), in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "BILL_RECEIVED"})
+}
+
+func (s *Server) finalizeUtility(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	var in struct {
+		Note string `json:"note"`
+	}
+	_ = decode(r, &in)
+	res, err := s.svc.SettleUtilityReservation(app.WithActor(r.Context(), a),
+		Param(r, "id"), Param(r, "rid"), in.Note)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	status := 201
+	if res.Idempotent {
+		status = 200
+	}
+	writeJSON(w, status, res)
+}
+
+func (s *Server) paySupplement(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	if err := s.svc.PayUtilitySupplement(app.WithActor(r.Context(), a),
+		Param(r, "id"), Param(r, "sid")); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "PAID"})
+}
+
+func (s *Server) autoUtilityBillDelay(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	ids, err := s.svc.MarkUtilityBillDelayed(app.WithActor(r.Context(), a))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"manual_review": ids})
 }
