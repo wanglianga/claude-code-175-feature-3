@@ -12,21 +12,22 @@ import (
 
 // LeaseTimeline 是一条租赁的完整档案视图: 合同/托管/交割/清单/维修/验房/扣款/争议/结算/台账/事件。
 type LeaseTimeline struct {
-	Contract     map[string]any   `json:"contract"`
-	Escrow       map[string]any   `json:"escrow"`
-	Handovers    []map[string]any `json:"handovers"`
-	Inventory    []map[string]any `json:"inventory"`
-	Repairs      []map[string]any `json:"repairs"`
-	Inspection   map[string]any   `json:"inspection"`
-	Findings     []map[string]any `json:"findings"`
-	Charges      []map[string]any `json:"charges"`
-	Disputes     []map[string]any `json:"disputes"`
-	Settlement   map[string]any   `json:"settlement"`
-	Ledger       []map[string]any `json:"fund_ledger"`
-	Events       []map[string]any `json:"events"`
-	Actions      []map[string]any `json:"dispute_actions"`
-	OpenDisputes int              `json:"open_disputes"`
-	Available    float64          `json:"available_to_release"`
+	Contract       map[string]any   `json:"contract"`
+	Escrow         map[string]any   `json:"escrow"`
+	Handovers      []map[string]any `json:"handovers"`
+	Inventory      []map[string]any `json:"inventory"`
+	Repairs        []map[string]any `json:"repairs"`
+	Inspection     map[string]any   `json:"inspection"`
+	Findings       []map[string]any `json:"findings"`
+	Charges        []map[string]any `json:"charges"`
+	Disputes       []map[string]any `json:"disputes"`
+	Settlement     map[string]any   `json:"settlement"`
+	UtilityReserve map[string]any   `json:"utility_reserve"`
+	Ledger         []map[string]any `json:"fund_ledger"`
+	Events         []map[string]any `json:"events"`
+	Actions        []map[string]any `json:"dispute_actions"`
+	OpenDisputes   int              `json:"open_disputes"`
+	Available      float64          `json:"available_to_release"`
 }
 
 type Queries struct{ pool *pgxpool.Pool }
@@ -121,8 +122,9 @@ func (q *Queries) LeaseTimeline(ctx context.Context, contractID string) (*LeaseT
 	if t.Settlement, err = q.row(ctx, `SELECT * FROM settlements WHERE contract_id=$1`, contractID); err != nil {
 		t.Settlement = map[string]any{}
 	}
+	t.UtilityReserve = q.utilityReserveView(ctx, contractID)
 	if t.Ledger, err = q.rows(ctx, `
-		SELECT seq,txn_type,amount,balance_after,hard_after,disputed_after,ref_type,reason,created_at
+		SELECT seq,txn_type,amount,balance_after,hard_after,disputed_after,utility_after,ref_type,reason,created_at
 		FROM fund_ledger WHERE contract_id=$1 ORDER BY seq`, contractID); err != nil {
 		return nil, err
 	}
@@ -140,7 +142,8 @@ func (q *Queries) LeaseTimeline(ctx context.Context, contractID string) (*LeaseT
 		bal := asFloat(t.Escrow["balance"])
 		hard := asFloat(n)
 		disp := asFloat(t.Escrow["disputed_hold"])
-		t.Available = round2(bal - hard - disp)
+		util := asFloat(t.Escrow["utility_hold"])
+		t.Available = round2(bal - hard - disp - util)
 	}
 	if r, e := q.row(ctx, `SELECT count(*)::int AS n FROM disputes WHERE contract_id=$1
 		AND status IN ('OPEN','EVIDENCE_PENDING','UNDER_REVIEW')`, contractID); e == nil {
@@ -161,6 +164,35 @@ func (q *Queries) ListContracts(ctx context.Context, role, userID string, limit 
 		deposit_amount,start_date,end_date,created_at FROM contracts
 		WHERE tenant_id=$1 OR landlord_id=$1 OR agent_id=$1
 		ORDER BY created_at DESC LIMIT $2`, userID, limit)
+}
+
+// utilityReserveView 聚合水电尾款预留(主单+分项+账单+照片)。无预留时返回空 map。
+func (q *Queries) utilityReserveView(ctx context.Context, contractID string) map[string]any {
+	r, err := q.row(ctx, `SELECT * FROM utility_reservations WHERE contract_id=$1`, contractID)
+	if err != nil || r == nil {
+		return map[string]any{}
+	}
+	if items, e := q.rows(ctx,
+		`SELECT * FROM utility_reserve_items WHERE reservation_id=$1 ORDER BY kind`, r["id"]); e == nil {
+		r["items"] = items
+	} else {
+		r["items"] = []any{}
+	}
+	if bills, e := q.rows(ctx,
+		`SELECT id,provider,bill_no,kind,period_start,period_end,billed_reading,amount,created_at
+		 FROM utility_bills WHERE contract_id=$1 ORDER BY created_at`, contractID); e == nil {
+		r["bills"] = bills
+	} else {
+		r["bills"] = []any{}
+	}
+	if photos, e := q.rows(ctx,
+		`SELECT id,kind,reading,reading_from,taken_at,evidence_id,uploaded_by,created_at
+		 FROM utility_moveout_photos WHERE contract_id=$1 ORDER BY created_at`, contractID); e == nil {
+		r["photos"] = photos
+	} else {
+		r["photos"] = []any{}
+	}
+	return r
 }
 
 func asFloat(v any) float64 {

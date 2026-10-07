@@ -53,6 +53,15 @@ func (s *Server) Routes() *Router {
 	r.Handle("POST", "api/v1/contracts/{id}/settlement/propose", s.withAuth(s.proposeSettlement))
 	r.Handle("POST", "api/v1/contracts/{id}/settlement/confirm", s.withAuth(s.confirmSettlement))
 
+	// 退租水电尾款预留结算
+	r.Handle("POST", "api/v1/contracts/{id}/utility-reserve", s.withAuth(s.createUtilityReserve))
+	r.Handle("GET", "api/v1/contracts/{id}/utility-reserve", s.withAuth(s.getUtilityReserve))
+	r.Handle("POST", "api/v1/contracts/{id}/utility-reserve/photos", s.withAuth(s.submitMoveoutPhoto))
+	r.Handle("POST", "api/v1/contracts/{id}/utility-reserve/bills", s.withAuth(s.receiveUtilityBill))
+	r.Handle("POST", "api/v1/contracts/{id}/utility-reserve/dispute", s.withAuth(s.openUtilityDispute))
+	r.Handle("POST", "api/v1/contracts/{id}/utility-reserve/manual-finalize", s.withAuth(s.manualFinalizeUtility))
+	r.Handle("POST", "api/v1/contracts/{id}/utility-reserve/topup", s.withAuth(s.payUtilityTopup))
+
 	// 平台: 逾期未验房巡检
 	r.Handle("POST", "api/v1/admin/overdue-inspections", s.withAuth(s.autoOverdue))
 
@@ -361,4 +370,101 @@ func (s *Server) autoOverdue(w http.ResponseWriter, r *http.Request, a app.Actor
 		return
 	}
 	writeJSON(w, 200, map[string]any{"opened": ids})
+}
+
+func (s *Server) createUtilityReserve(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	var in app.CreateUtilityReserveInput
+	_ = decode(r, &in)
+	id, amount, err := s.svc.CreateUtilityReserve(app.WithActor(r.Context(), a), Param(r, "id"), in)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 201, map[string]any{
+		"reservation_id": id, "reserve_amount": amount, "status": "RESERVED",
+	})
+}
+
+func (s *Server) getUtilityReserve(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	cid := Param(r, "id")
+	if err := s.q.AssertContractParty(r.Context(), cid, a); err != nil {
+		writeErr(w, err)
+		return
+	}
+	tl, err := s.q.LeaseTimeline(r.Context(), cid)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, tl.UtilityReserve)
+}
+
+func (s *Server) submitMoveoutPhoto(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	var in app.MoveoutPhotoInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	id, err := s.svc.SubmitMoveoutPhoto(app.WithActor(r.Context(), a), Param(r, "id"), in)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 201, map[string]string{"photo_id": id})
+}
+
+func (s *Server) receiveUtilityBill(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	var in app.UtilityBillInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	res, err := s.svc.ReceiveUtilityBill(app.WithActor(r.Context(), a), Param(r, "id"), in)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	code := 200
+	if res != nil && !res.Reused && res.BillID != "" {
+		code = 201
+	}
+	writeJSON(w, code, res)
+}
+
+func (s *Server) openUtilityDispute(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	var in app.UtilityDisputeInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	id, err := s.svc.OpenUtilityDispute(app.WithActor(r.Context(), a), Param(r, "id"), in)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 201, map[string]string{
+		"dispute_id": id, "reason": "UTILITY_FINAL_SETTLEMENT", "status": "OPEN",
+	})
+}
+
+func (s *Server) manualFinalizeUtility(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	var in app.ManualUtilityFinalizeInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if err := s.svc.ManualFinalizeUtilityReserve(app.WithActor(r.Context(), a), Param(r, "id"), in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "FINALIZED"})
+}
+
+func (s *Server) payUtilityTopup(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	amount, err := s.svc.PayUtilityTopup(app.WithActor(r.Context(), a), Param(r, "id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"topped_up": amount, "status": "ok"})
 }

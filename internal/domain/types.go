@@ -48,6 +48,25 @@ func OpenDisputeStatuses() []string {
 	return []string{DisputeOpen, DisputeEvidencePending, DisputeUnderReview}
 }
 
+// 水电尾款预留状态
+const (
+	UtilityReserveReserved      = "RESERVED"       // 已预留, 等待最后一期供应商账单
+	UtilityReserveReviewPending = "REVIEW_PENDING" // 待处理(账单延迟等, 暂挂)
+	UtilityReserveManualReview  = "MANUAL_REVIEW"  // 读数无法对应/分摊争议, 人工复核
+	UtilityReserveFinalized     = "FINALIZED"      // 已最终结算(多退少补定论)
+)
+
+// UtilityFinalDisputeReason 是水电尾款分摊/读数争议的原因码。
+const UtilityFinalDisputeReason = "UTILITY_FINAL_SETTLEMENT"
+
+// 复核分项标志
+const (
+	UtilityFlagOK              = "OK"
+	UtilityFlagBillDelay       = "BILL_DELAY"
+	UtilityFlagReadingMismatch = "READING_MISMATCH"
+	UtilityFlagSplitDispute    = "SPLIT_DISPUTE"
+)
+
 type Contract struct {
 	ID                string    `json:"id"`
 	LeaseNo           string    `json:"lease_no"`
@@ -74,6 +93,7 @@ type Escrow struct {
 	Balance       float64   `json:"balance"`
 	HardHold      float64   `json:"hard_hold"`
 	DisputedHold  float64   `json:"disputed_hold"`
+	UtilityHold   float64   `json:"utility_hold"`
 	ReleasedTotal float64   `json:"released_total"`
 	Version       int64     `json:"version"`
 	UpdatedAt     time.Time `json:"updated_at"`
@@ -81,7 +101,7 @@ type Escrow struct {
 
 // Available 返回当前可释放给租客的金额(未被任何预留占用)。
 func (e Escrow) Available() float64 {
-	return e.Balance - e.HardHold - e.DisputedHold
+	return e.Balance - e.HardHold - e.DisputedHold - e.UtilityHold
 }
 
 type InventoryItem struct {

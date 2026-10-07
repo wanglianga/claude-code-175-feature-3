@@ -140,7 +140,7 @@ func (s *Service) DepositIn(ctx context.Context, contractID string) error {
 			return fmt.Errorf("open escrow: %w", err)
 		}
 		if err := s.ledger(tx, ctx, contractID, "DEPOSIT_IN", c.DepositAmount,
-			c.DepositAmount, 0, 0, "", "", "租客押金充入托管账户", "deposit:"+contractID); err != nil {
+			c.DepositAmount, 0, 0, 0, "", "", "租客押金充入托管账户", "deposit:"+contractID); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx,

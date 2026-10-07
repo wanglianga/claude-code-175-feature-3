@@ -171,7 +171,7 @@ func (s *Service) SubmitInspection(ctx context.Context, contractID string, in Su
 				return err
 			}
 			if priorHold > 0 {
-				if err := s.ledger(tx, ctx, contractID, "HOLD_RELEASE", priorHold, 0, 0, -priorHold,
+				if err := s.ledger(tx, ctx, contractID, "HOLD_RELEASE", priorHold, 0, 0, -priorHold, 0,
 					"inspection", inspID, "复检: 撤销上一版扣款建议冻结", ""); err != nil {
 					return err
 				}
@@ -198,6 +198,14 @@ func (s *Service) SubmitInspection(ctx context.Context, contractID string, in Su
 			return err
 		}
 
+		// 若已创建水电尾款预留, 验房不再重复生成水电欠费主张(最后一期账单由预留流程结算)。
+		var reserveExists bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM utility_reservations WHERE contract_id=$1)`,
+			contractID).Scan(&reserveExists); err != nil {
+			return err
+		}
+
 		total := 0.0
 		for _, f := range r.Facts {
 			var fid string
@@ -220,6 +228,10 @@ func (s *Service) SubmitInspection(ctx context.Context, contractID string, in Su
 				rules.ChargeUtilityArrears: "UTILITY_UNPAID",
 				rules.ChargeKeyLoss:        "KEY_LOSS",
 			}[ch.Code]
+			if kind == "UTILITY_UNPAID" && reserveExists {
+				// 最后一期水电由 utility_hold 预留流程结算, 避免与验房欠费主张双重扣款。
+				continue
+			}
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO charge_items(contract_id,kind,title,amount,status,created_by,evidence_ids)
 				VALUES($1,$2,$3,$4,'PROPOSED',$5,$6::uuid[])`,
@@ -232,7 +244,7 @@ func (s *Service) SubmitInspection(ctx context.Context, contractID string, in Su
 
 		// 关键: 建议金额只进入 disputed_hold(软冻结), 在租客确认或争议闭合前任何人都拿不到。
 		if total > 0 {
-			if err := s.ledger(tx, ctx, contractID, "HOLD_PROPOSE", total, 0, 0, total,
+			if err := s.ledger(tx, ctx, contractID, "HOLD_PROPOSE", total, 0, 0, total, 0,
 				"inspection", inspID, "验房扣款建议冻结(待租客确认/申诉)", ""); err != nil {
 				return err
 			}
@@ -331,7 +343,7 @@ func (s *Service) AcceptItem(ctx context.Context, contractID, itemType, itemID s
 			return err
 		}
 		if amount > 0 {
-			if err := s.ledger(tx, ctx, contractID, "HOLD_CONFIRM", amount, 0, amount, -amount,
+			if err := s.ledger(tx, ctx, contractID, "HOLD_CONFIRM", amount, 0, amount, -amount, 0,
 				itemType, itemID, "租客确认扣款, 软冻结转定论预留", ""); err != nil {
 				return err
 			}
@@ -563,9 +575,11 @@ func (s *Service) resolveByAmount(tx pgx.Tx, ctx context.Context, contractID, di
 	award float64, resolveStatus, note string, in DisputeActionInput) error {
 	var reason, fStr, cStr string
 	var proposed float64
+	var reserveID *string
 	if err := tx.QueryRow(ctx, `
-		SELECT reason, COALESCE(finding_id::text,''), COALESCE(charge_id::text,'')
-		FROM disputes WHERE id=$1`, disputeID).Scan(&reason, &fStr, &cStr); err != nil {
+		SELECT reason, COALESCE(finding_id::text,''), COALESCE(charge_id::text,''),
+		       utility_reserve_id::text
+		FROM disputes WHERE id=$1`, disputeID).Scan(&reason, &fStr, &cStr, &reserveID); err != nil {
 		return err
 	}
 	itemType, itemID := "", ""
@@ -581,6 +595,11 @@ func (s *Service) resolveByAmount(tx pgx.Tx, ctx context.Context, contractID, di
 			`SELECT amount FROM charge_items WHERE id=$1`, itemID).Scan(&proposed); err != nil {
 			return err
 		}
+	}
+	// 水电尾款预留争议: 不挂 finding/charge, 以"支持房东的实际水电费用"定论后重算预留。
+	if reserveID != nil && *reserveID != "" {
+		return s.resolveUtilityDispute(tx, ctx, contractID, disputeID, *reserveID,
+			resolveStatus, note, in)
 	}
 	// INSPECTION_DELAY 等不挂款项的争议: 直接闭合, 无资金动作。
 	if itemType == "" {
@@ -614,13 +633,13 @@ func (s *Service) resolveByAmount(tx pgx.Tx, ctx context.Context, contractID, di
 
 	// 资金联动: 原额在 disputed_hold。支持部分转 hard_hold, 未支持部分立即解冻(变可退余额)。
 	if award > 0 {
-		if err := s.ledger(tx, ctx, contractID, "HOLD_CONFIRM", award, 0, award, -award,
+		if err := s.ledger(tx, ctx, contractID, "HOLD_CONFIRM", award, 0, award, -award, 0,
 			itemType, itemID, "争议定论支持房东部分: "+note, ""); err != nil {
 			return err
 		}
 	}
 	if freed > 0 {
-		if err := s.ledger(tx, ctx, contractID, "HOLD_RELEASE", freed, 0, 0, -freed,
+		if err := s.ledger(tx, ctx, contractID, "HOLD_RELEASE", freed, 0, 0, -freed, 0,
 			itemType, itemID, "争议定论撤销的扣款预留: "+note, ""); err != nil {
 			return err
 		}
@@ -703,17 +722,55 @@ func (s *Service) ProposeSettlement(ctx context.Context, contractID, note string
 		if err := checkStatus(st, domain.StatusDeductionProposed, domain.StatusDisputing); err != nil {
 			return err
 		}
-		var balance, hard, disputed, deposit float64
+		var balance, hard, disputed, deposit, utilHold float64
 		if err := tx.QueryRow(ctx, `
-			SELECT e.balance, e.hard_hold, e.disputed_hold, c.deposit_amount
+			SELECT e.balance, e.hard_hold, e.disputed_hold, c.deposit_amount, e.utility_hold
 			FROM escrow_accounts e JOIN contracts c ON c.id=e.contract_id
 			WHERE e.contract_id=$1`, contractID).
-			Scan(&balance, &hard, &disputed, &deposit); err != nil {
+			Scan(&balance, &hard, &disputed, &deposit, &utilHold); err != nil {
 			return err
 		}
 		if disputed > 0 {
 			return fmt.Errorf("%w: 仍有 %.2f 元扣款项处于待确认/争议中, 不能生成结算",
 				ErrUnresolved, disputed)
+		}
+		// 任何未闭合争议(含不直接占款的水电预留争议)都阻止结算。
+		var openDisputes int
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*) FROM disputes WHERE contract_id=$1
+			  AND status IN ('OPEN','EVIDENCE_PENDING','UNDER_REVIEW')`, contractID).
+			Scan(&openDisputes); err != nil {
+			return err
+		}
+		if openDisputes > 0 {
+			return fmt.Errorf("%w: 仍有 %d 个未闭合争议, 不能生成结算", ErrUnresolved, openDisputes)
+		}
+		// 水电尾款预留必须已最终结算, 且不足部分补缴到账(多出部分此时已回到可退余额)。
+		var reserveAmt, topupRcvd float64
+		var reserveFinalized bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS(SELECT 1 FROM utility_reservations WHERE contract_id=$1),
+			       COALESCE((SELECT reserve_amount FROM utility_reservations WHERE contract_id=$1),0),
+			       COALESCE((SELECT topup_received FROM utility_reservations WHERE contract_id=$1),0)`,
+			contractID).Scan(&reserveFinalized, &reserveAmt, &topupRcvd); err != nil {
+			return err
+		}
+		if utilHold > 0 {
+			return fmt.Errorf("%w: 水电尾款预留 %.2f 元尚未最终结算, 不能生成结算",
+				ErrUnresolved, utilHold)
+		}
+		var shortageUnpaid, reserveFinal float64
+		if reserveFinalized {
+			if err := tx.QueryRow(ctx, `
+				SELECT GREATEST(shortage_amount - topup_received, 0), final_amount
+				FROM utility_reservations WHERE contract_id=$1`, contractID).
+				Scan(&shortageUnpaid, &reserveFinal); err != nil {
+				return err
+			}
+			if shortageUnpaid > 0 {
+				return fmt.Errorf("%w: 水电尾款仍有 %.2f 元补缴未到账, 不能生成结算",
+					ErrUnresolved, shortageUnpaid)
+			}
 		}
 		// 汇总定论项
 		var fids, cids []string
@@ -758,23 +815,26 @@ func (s *Service) ProposeSettlement(ctx context.Context, contractID, note string
 		}
 		err = tx.QueryRow(ctx, `
 			INSERT INTO settlements(contract_id,deposit_amount,deducted_total,returned_to_tenant,
-			                        paid_to_landlord,status,note,finding_ids,charge_ids)
-			VALUES($1,$2,$3,$4,$5,'PROPOSED',$6,$7::uuid[],$8::uuid[])
+			                        paid_to_landlord,status,note,finding_ids,charge_ids,
+			                        utility_reserved,utility_topup)
+			VALUES($1,$2,$3,$4,$5,'PROPOSED',$6,$7::uuid[],$8::uuid[],$9,$10)
 			ON CONFLICT (contract_id) DO UPDATE
 			  SET deposit_amount=EXCLUDED.deposit_amount, deducted_total=EXCLUDED.deducted_total,
 			      returned_to_tenant=EXCLUDED.returned_to_tenant, paid_to_landlord=EXCLUDED.paid_to_landlord,
 			      status='PROPOSED', note=EXCLUDED.note,
 			      tenant_confirmed_by=NULL, landlord_confirmed_by=NULL,
 			      tenant_confirmed_at=NULL, landlord_confirmed_at=NULL,
-			      finding_ids=EXCLUDED.finding_ids, charge_ids=EXCLUDED.charge_ids
+			      finding_ids=EXCLUDED.finding_ids, charge_ids=EXCLUDED.charge_ids,
+			      utility_reserved=EXCLUDED.utility_reserved, utility_topup=EXCLUDED.utility_topup
 			RETURNING id::text`,
 			contractID, deposit, hard, return2tenant, hard, note,
-			pgUUIDArrayLiteral(fids), pgUUIDArrayLiteral(cids)).Scan(&id)
+			pgUUIDArrayLiteral(fids), pgUUIDArrayLiteral(cids), reserveFinal, topupRcvd).Scan(&id)
 		if err != nil {
 			return fmt.Errorf("upsert settlement: %w", err)
 		}
 		return s.emit(tx, ctx, contractID, "SettlementProposed", map[string]any{
 			"settlement_id": id, "deducted_total": hard, "returned_to_tenant": return2tenant,
+			"utility_final": reserveFinal, "utility_topup": topupRcvd,
 		}, actor(ctx).ID)
 	})
 	return id, err
@@ -870,13 +930,13 @@ func (s *Service) executeRelease(tx pgx.Tx, ctx context.Context, contractID, sid
 	}
 	toTenant := round2(balance - hard)
 	if hard > 0 {
-		if err := s.ledger(tx, ctx, contractID, "DEDUCT", hard, -hard, -hard, 0,
+		if err := s.ledger(tx, ctx, contractID, "DEDUCT", hard, -hard, -hard, 0, 0,
 			"settlement", sid, "定论扣款支付给房东", ""); err != nil {
 			return err
 		}
 	}
 	if toTenant > 0 {
-		if err := s.ledger(tx, ctx, contractID, "RELEASE_TO_TENANT", toTenant, -toTenant, 0, 0,
+		if err := s.ledger(tx, ctx, contractID, "RELEASE_TO_TENANT", toTenant, -toTenant, 0, 0, 0,
 			"settlement", sid, "押金余额退还租客", ""); err != nil {
 			return err
 		}

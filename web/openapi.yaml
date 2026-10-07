@@ -35,6 +35,8 @@ tags:
     description: 争议申诉、补证、协商与平台裁决
   - name: settlement
     description: 结算与押金释放
+  - name: utility
+    description: 退租水电尾款预留、供应商账单与搬离表计照片复核、多退少补
   - name: admin
     description: 平台运营
   - name: ops
@@ -464,6 +466,7 @@ paths:
                     - INSPECTION_DELAY
                     - EARLY_TERMINATION
                     - CLEANING_FEE
+                    - UTILITY_FINAL_SETTLEMENT
                     - OTHER
                 subject: {type: string}
                 comment: {type: string}
@@ -616,6 +619,207 @@ paths:
           content:
             application/json:
               schema: {$ref: "#/components/schemas/Error"}
+
+  /api/v1/contracts/{id}/utility-reserve:
+    post:
+      tags: [utility]
+      summary: 创建退租水电尾款预留(押金第四层 utility_hold 圈定)
+      description: |
+        租客搬离时最后一期供应商账单尚未生成, 平台按**搬离最近读数 + 历史月均用量**预留一笔押金,
+        返回并向双方展示**预留原因(reason)与预计结算时间(expected_settle_at)**。
+        若验房已生成"水电欠费"待确认建议, 由本预留接管并撤销其软冻结, 避免双重扣款;
+        水电已在验房中定论扣款(ACCEPTED/UPHELD)则返回 409。
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expected_settle_days: {type: integer, default: 30, description: 自搬离日起预计结算天数}
+                kinds:
+                  type: array
+                  items: {type: string, enum: [WATER, ELECTRIC, GAS]}
+                  description: 缺省为全部有退租读数的品类
+                note: {type: string}
+      responses:
+        "201":
+          description: 预留已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reservation_id: {type: string, format: uuid}
+                  reserve_amount: {type: number}
+                  status: {type: string, example: RESERVED}
+        "409": {$ref: "#/components/responses/Error"}
+    get:
+      tags: [utility]
+      summary: 查询水电尾款预留详情(预留原因/预计结算时间/分项账单与照片/复核状态/多退少补)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/UtilityReserve"}
+  /api/v1/contracts/{id}/utility-reserve/photos:
+    post:
+      tags: [utility]
+      summary: 租客提交搬离当天水表/电表照片(读数与供应商账单一起复核, 不按账单金额直接扣款)
+      description: |
+        每品类一条(补传覆盖); FINALIZED 后禁止补传。同一证据重复提交幂等, 不产生资金变化。
+        照片补齐后若账单读数与照片读数在容差内一致, 自动最终结算; 读数无法对应则转 MANUAL_REVIEW。
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, reading, evidence_id]
+              properties:
+                kind: {type: string, enum: [WATER, ELECTRIC, GAS]}
+                reading: {type: number, description: 照片上的表计读数}
+                taken_at: {type: string, format: date-time}
+                evidence_id: {type: string, format: uuid}
+                note: {type: string}
+      responses:
+        "201":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  photo_id: {type: string, format: uuid}
+        "409": {$ref: "#/components/responses/Error"}
+  /api/v1/contracts/{id}/utility-reserve/bills:
+    post:
+      tags: [utility]
+      summary: 登记供应商最后一期账单(按 供应商+账单号 幂等)并触发账单×照片复核
+      description: |
+        重复收到同一账单返回 `reused=true`, **绝不产生第二笔扣款**。登记后立即复核:
+        账单缺失→REVIEW_PENDING(BILL_DELAY); 账单读数低于搬离最近读数或与照片读数超容差→MANUAL_REVIEW
+        (READING_MISMATCH); 存在分摊争议→MANUAL_REVIEW(SPLIT_DISPUTE); 一致则 FINALIZED 并多退少补。
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [bill_no, kind, amount]
+              properties:
+                provider: {type: string, default: SUPPLIER}
+                bill_no: {type: string, description: 供应商账单号(幂等键)}
+                kind: {type: string, enum: [WATER, ELECTRIC, GAS]}
+                period_start: {type: string, format: date}
+                period_end: {type: string, format: date}
+                billed_reading: {type: number}
+                amount: {type: number}
+                invoice_evidence_id: {type: string, format: uuid}
+      responses:
+        "200":
+          description: 账单已存在(幂等)或处理完成
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/UtilityBillResult"}
+        "201":
+          description: 新账单已登记并复核
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/UtilityBillResult"}
+        "409": {$ref: "#/components/responses/Error"}
+  /api/v1/contracts/{id}/utility-reserve/dispute:
+    post:
+      tags: [utility]
+      summary: 双方就水电费用分摊/读数对应打开争议(预留款保持待处理并进入人工复核)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject]
+              properties:
+                kind: {type: string, enum: [WATER, ELECTRIC, GAS]}
+                subject: {type: string}
+                comment: {type: string}
+                claimed_amount: {type: number}
+                evidence_ids: {type: array, items: {type: string, format: uuid}}
+      responses:
+        "201":
+          description: 争议已打开, 预留转 MANUAL_REVIEW
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dispute_id: {type: string, format: uuid}
+                  reason: {type: string, example: UTILITY_FINAL_SETTLEMENT}
+                  status: {type: string, example: OPEN}
+        "409": {$ref: "#/components/responses/Error"}
+  /api/v1/contracts/{id}/utility-reserve/manual-finalize:
+    post:
+      tags: [utility]
+      summary: 平台人工复核定论最终水电费用(账单延迟/读数无法对应/分摊争议闭合后; 仅平台)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amounts]
+              properties:
+                amounts:
+                  type: object
+                  description: 各品类(WATER/ELECTRIC/GAS)最终费用
+                  additionalProperties: {type: number}
+                note: {type: string}
+      responses:
+        "200":
+          description: 已最终结算
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, example: FINALIZED}
+        "409": {$ref: "#/components/responses/Error"}
+  /api/v1/contracts/{id}/utility-reserve/topup:
+    post:
+      tags: [utility]
+      summary: 租客补缴水电尾款不足部分(实际费用 > 预留; 仅可补到 shortage 为止)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      responses:
+        "200":
+          description: 补缴到账
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  topped_up: {type: number}
+                  status: {type: string, example: ok}
+        "409": {$ref: "#/components/responses/Error"}
 
   /api/v1/admin/overdue-inspections:
     post:
@@ -823,8 +1027,62 @@ components:
         charges: {type: array, items: {type: object}}
         disputes: {type: array, items: {$ref: "#/components/schemas/Dispute"}}
         settlement: {type: object}
+        utility_reserve: {$ref: "#/components/schemas/UtilityReserve"}
         fund_ledger: {type: array, items: {type: object}}
         events: {type: array, items: {type: object}}
         dispute_actions: {type: array, items: {$ref: "#/components/schemas/DisputeAction"}}
         open_disputes: {type: integer}
         available_to_release: {type: number}
+    UtilityReserveItem:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        kind: {type: string, enum: [WATER, ELECTRIC, GAS]}
+        last_reading: {type: number}
+        history_avg_usage: {type: number}
+        unit_price: {type: number}
+        est_amount: {type: number}
+        billed_reading: {type: number}
+        billed_amount: {type: number}
+        photo_reading: {type: number}
+        photo_amount: {type: number}
+        final_reading: {type: number}
+        final_amount: {type: number}
+        review_flag: {type: string, enum: [OK, BILL_DELAY, READING_MISMATCH, SPLIT_DISPUTE]}
+    UtilityReserve:
+      type: object
+      description: 水电尾款预留(一条租赁至多一笔), 含预留原因/预计结算时间/账单/照片/多退少补。
+      properties:
+        id: {type: string, format: uuid}
+        status: {type: string, enum: [RESERVED, REVIEW_PENDING, MANUAL_REVIEW, FINALIZED]}
+        reserve_amount: {type: number}
+        reason: {type: string}
+        basis_snapshot: {type: object}
+        expected_settle_at: {type: string, format: date}
+        billed_total: {type: number}
+        photo_total: {type: number}
+        final_amount: {type: number}
+        final_decision: {type: string, enum: [BILL, PHOTO, MANUAL]}
+        review_note: {type: string}
+        refund_amount: {type: number, description: 预留多于实际, 已释放回可退余额}
+        shortage_amount: {type: number, description: 实际多于预留, 需向租客补缴}
+        topup_received: {type: number}
+        created_at: {type: string, format: date-time}
+        reviewed_at: {type: string, format: date-time}
+        finalized_at: {type: string, format: date-time}
+        items: {type: array, items: {$ref: "#/components/schemas/UtilityReserveItem"}}
+        bills: {type: array, items: {type: object}}
+        photos: {type: array, items: {type: object}}
+    UtilityBillResult:
+      type: object
+      properties:
+        bill_id: {type: string, format: uuid}
+        reused: {type: boolean, description: true=重复账单幂等返回, 未再次扣款}
+        reservation_id: {type: string, format: uuid}
+        status: {type: string, enum: [RESERVED, REVIEW_PENDING, MANUAL_REVIEW, FINALIZED]}
+        finalized: {type: boolean}
+        final_amount: {type: number}
+        refund_amount: {type: number}
+        shortage_amount: {type: number}
+        blocker: {type: string, enum: ["", BILL_DELAY, READING_MISMATCH, SPLIT_DISPUTE]}
+        notes: {type: array, items: {type: string}}

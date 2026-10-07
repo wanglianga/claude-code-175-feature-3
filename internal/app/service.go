@@ -103,23 +103,24 @@ func (s *Service) notify(tx pgx.Tx, ctx context.Context, contractID, userID, tem
 	return err
 }
 
-// ledger 追加资金台账并原子更新 escrow 三层金额。
-// deltaHard/deltaDisputed 可正可负; balanceDelta 仅用于入金/出金。
+// ledger 追加资金台账并原子更新 escrow 四层金额。
+// deltaHard/deltaDisputed/deltaUtility 可正可负; balanceDelta 仅用于入金/出金。
 func (s *Service) ledger(tx pgx.Tx, ctx context.Context, contractID, txnType string,
-	amount float64, balanceDelta, deltaHard, deltaDisputed float64,
+	amount float64, balanceDelta, deltaHard, deltaDisputed, deltaUtility float64,
 	refType, refID, reason, idemKey string) error {
-	var bal, hard, disp float64
+	var bal, hard, disp, util float64
 	row := tx.QueryRow(ctx, `
 		UPDATE escrow_accounts
 		SET balance = balance + $2,
 		    hard_hold = hard_hold + $3,
 		    disputed_hold = disputed_hold + $4,
+		    utility_hold = utility_hold + $5,
 		    version = version + 1,
 		    updated_at = now()
 		WHERE contract_id = $1
-		RETURNING balance, hard_hold, disputed_hold`,
-		contractID, balanceDelta, deltaHard, deltaDisputed)
-	if err := row.Scan(&bal, &hard, &disp); err != nil {
+		RETURNING balance, hard_hold, disputed_hold, utility_hold`,
+		contractID, balanceDelta, deltaHard, deltaDisputed, deltaUtility)
+	if err := row.Scan(&bal, &hard, &disp, &util); err != nil {
 		return fmt.Errorf("update escrow: %w", err)
 	}
 	var seq int64
@@ -128,10 +129,10 @@ func (s *Service) ledger(tx pgx.Tx, ctx context.Context, contractID, txnType str
 		return err
 	}
 	_, err := tx.Exec(ctx, `
-		INSERT INTO fund_ledger(contract_id,seq,txn_type,amount,balance_after,hard_after,disputed_after,
+		INSERT INTO fund_ledger(contract_id,seq,txn_type,amount,balance_after,hard_after,disputed_after,utility_after,
 		                        ref_type,ref_id,reason,actor_id,idempotency_key)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,NULLIF($9,'')::uuid,$10,NULLIF($11,'')::uuid,NULLIF($12,''))`,
-		contractID, seq, txnType, round2(amount), round2(bal), round2(hard), round2(disp),
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,'')::uuid,$11,NULLIF($12,'')::uuid,NULLIF($13,''))`,
+		contractID, seq, txnType, round2(amount), round2(bal), round2(hard), round2(disp), round2(util),
 		refType, refID, reason, actor(ctx).ID, idemKey)
 	return err
 }
